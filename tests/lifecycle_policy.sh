@@ -5,6 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+# v3 默认只警告。本文件锁定 strict，确认旧的 fail-closed 仍然成立。
+export CLAUDE_GUARD_STRICT_LIFECYCLE=1
+
 mkdir -p "$TMP_DIR/bin" "$TMP_DIR/project/.claude"
 
 cat >"$TMP_DIR/fake-claude" <<'EOF'

@@ -2,6 +2,20 @@
 
 更完整的版本目标、设计边界和验证说明见 README 的“版本历史”部分。
 
+## 3.0.0 - 2026-11-09
+
+本分支相对上游 `wetlink/claude-guard` `2.1.3` 的行为变化。出口白名单、代理 CONNECT、TLS issuer 和 IPv6 仍是硬门禁。
+
+- **生命周期默认只警告。** hooks、插件、后台会话、agent view、workflows、cron、Remote Control、deep-link 和子代理上限不再在预检一开始就退出，因此 `doctor` / `--precheck-only` 会继续做网络检查。settings 文件缺失同样只警告并继续。`CLAUDE_GUARD_STRICT_LIFECYCLE=1` 或配置 `strict_lifecycle: true` 在网络检查完成后以退出码 13 恢复 fail-closed，并在启动时注入对应的禁用环境变量。环境变量优先于配置。
+- **路由、凭据、证书、`processWrapper`、`CLAUDE_CODE_RETRY_WATCHDOG`、`--settings` / `--setting-sources`，以及 `blocked_plugins` 里已启用的插件，仍然立刻拒绝。** 示例配置不再把 `codex@openai-codex` 放进拒绝名单。
+- **客户端版本与 SHA-256 保持可选锁定。** 不填写时接受 Claude Code 2.1.3xx；填写后不匹配仍失败。
+- **出口不一致时的文案写明探测路径。** 仍通过配置的代理请求 `api.anthropic.com/cdn-cgi/trace`，失败信息包含探测到的 IP、允许列表、URL 和代理，并说明默认不会结束已经在跑的后台会话。
+- **只读 mihomo。** `CLAUDE_GUARD_MIHOMO` 默认 `auto`，只在 `doctor` 里查询。控制器可以是 Clash Verge 的 unix socket，或 `mihomo.api` / `CLAUDE_GUARD_MIHOMO_API` 给出的 `unix://` / `http://` 地址。只发 `GET`，查询 `/configs`、`/proxies`、`/rules`、`/connections`。报告期望组、选中节点、组内 DIRECT 或未列入 `allowed_nodes` 的节点、`tun.strict-route`，以及官方域名是否被 Domain / DomainSuffix / DomainKeyword / Match 覆盖。打印建议的 Clash 片段，不写入配置或订阅。`CLAUDE_GUARD_MIHOMO_STRICT=1` 或 `mihomo.strict: true` 让这些告警以退出码 15 失败。控制器不可达只警告。遥测域名不触发严格失败。密钥来自调用者提供的 `mihomo.secret` 或 `CLAUDE_GUARD_MIHOMO_SECRET`，输出里不出现。
+- **看门狗默认不碰已有会话。** 漂移时记录 `DRY RUN: would pause`，并写明 existing session left running、新的启动由预检拦住。`CLAUDE_GUARD_WATCHDOG_STRICT=1` 对目标进程树发 `TERM` 或 `STOP`。只设 `CLAUDE_GUARD_WATCHDOG_DRY_RUN=0` 仍以退出码 9 拒绝。通知仍是 opt-in。
+- **桌面端只检测。** `doctor` 报告 Claude.app、捆绑的 `claude-code` 进程、混合端口、已安装捆绑版本，以及 macOS 传统登录项。不修改登录项。开机竞态的处理方式写在 README。
+
+本版不做：时区 / locale / 指纹伪装，token 读取或转发，请求改写，封禁规避，自动修改 Clash 或登录项，一键写入遥测开关，hook 模式，以及多机器配置同步。
+
 ## 2.1.3 - 2026-08-27
 
 - **所有 curl 调用改为以 `-q` 作为首参。** curl 默认读取 `~/.curlrc`，而

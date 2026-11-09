@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="2.1.3"
+VERSION="3.0.0"
 
 CONFIG_FILE="${CLAUDE_GUARD_CONFIG:-${SAFE_CLAUDE_CONFIG:-$HOME/.safe-claude-official.json}}"
 OFFICIAL_SETTINGS_OVERRIDE="${CLAUDE_GUARD_SETTINGS:-}"
@@ -36,6 +36,22 @@ NOTIFY_ENABLED="${CLAUDE_GUARD_NOTIFY:-0}"
 DRY_RUN_STDERR="${CLAUDE_GUARD_DRY_RUN_STDERR:-0}"
 FINGERPRINT_MODE="${CLAUDE_GUARD_FINGERPRINT_MODE:-fail-active}"
 LEGACY_PROFILE_MODE="${CLAUDE_GUARD_LEGACY_PROFILE_MODE:-warn}"
+STRICT_LIFECYCLE=0
+LIFECYCLE_BLOCK=0
+WATCHDOG_STRICT=0
+WATCHDOG_STRICT_SIGNAL="TERM"
+MIHOMO_STRICT=0
+MIHOMO_FINDINGS=0
+DOCTOR_BLOCK=0
+DOCTOR_ENV_REPORTED=0
+MIHOMO_KIND=""
+MIHOMO_SOCKET=""
+MIHOMO_HTTP_BASE=""
+MIHOMO_SECRET=""
+MIHOMO_SELECTED_NODE=""
+MIHOMO_CONN_JSON=""
+LAUNCH_BLOCK_FILE="${CLAUDE_GUARD_LAUNCH_BLOCK_FILE:-$HOME/.claude-guard/launch-block}"
+CURRENT_IP_SOURCE=""
 SETTINGS_RISK_RE='ANTHROPIC_(BASE_URL|AUTH_TOKEN|API_KEY|CUSTOM_HEADERS|AWS_BASE_URL|BEDROCK_BASE_URL|VERTEX_BASE_URL|FOUNDRY_BASE_URL)|apiKeyHelper|PROXY_MANAGED|CLAUDE_CODE_USE_(GATEWAY|BEDROCK|VERTEX|FOUNDRY|ANTHROPIC_AWS|MANTLE)|CLAUDE_CODE_PROCESS_WRAPPER|processWrapper|CLAUDE_CODE_RETRY_WATCHDOG|CLAUDE_CODE_ATTRIBUTION_HEADER|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NODE_EXTRA_CA_CERTS|SSL_CERT_FILE|CLAUDE_CODE_CERT_STORE|CLAUDE_CONFIG_DIR'
 PRECHECK_ONLY=0
 COMMAND_MODE="run"
@@ -86,8 +102,21 @@ Environment:
                               auto renders the visual preflight only in an interactive terminal.
   NO_COLOR                   Disable ANSI colors while keeping the visual preflight layout.
   CLAUDE_GUARD_WATCHDOG      Set to 0 to disable runtime guarding. Default: 1
+  CLAUDE_GUARD_STRICT_LIFECYCLE
+                              Default: 0. Lifecycle gaps warn only. Set to 1 to
+                              fail closed after the network checks.
   CLAUDE_GUARD_WATCHDOG_DRY_RUN
-                              Default: 1. Logs would-pause/would-resume actions only.
+                              Default: 1. Logs would-pause/would-resume and leaves
+                              existing sessions running.
+  CLAUDE_GUARD_WATCHDOG_STRICT
+                              Default: 0. Set to 1 to signal an existing session
+                              when egress drifts. Does not change the default.
+  CLAUDE_GUARD_WATCHDOG_STRICT_SIGNAL
+                              TERM or STOP. Default: TERM. Used only with strict.
+  CLAUDE_GUARD_MIHOMO        auto, on, or off. Default: auto (doctor only).
+  CLAUDE_GUARD_MIHOMO_API    unix:///path.sock or http://127.0.0.1:9090.
+  CLAUDE_GUARD_MIHOMO_STRICT Default: 0. Set to 1 to fail doctor on DIRECT,
+                              uncovered required domains, or strict-route off.
   CLAUDE_GUARD_RECOVERY_INTERVAL
                               Seconds between paired IP/API probes while degraded. Default: 30.
   CLAUDE_GUARD_DRY_RUN_STDERR
@@ -102,11 +131,12 @@ Environment:
                               If unset, reads boolean `notify` from the safe config. Default: off.
 
 Lifecycle policy:
-  Detached background agents, cron, workflows, Remote Control, deep-link
-  registration, and automatic updates must be disabled in the official
-  settings file. TUI-scoped background Bash and subagents are allowed and
-  must terminate with the foreground session. Project settings and CLI flags
-  cannot override the guarded settings or official Anthropic route.
+  Default is warn-only. Hooks, plugins, background sessions, workflows, cron,
+  and Remote Control may stay enabled. Set CLAUDE_GUARD_STRICT_LIFECYCLE=1
+  or "strict_lifecycle": true to restore fail-closed after network checks.
+  Egress allowlist, proxy CONNECT, TLS issuer, and IPv6 stay hard gates and
+  run even when settings are absent. Route, credential, and certificate
+  overrides still fail closed. Client version and SHA-256 are optional pins.
 
 The config file must contain:
   {
@@ -579,8 +609,93 @@ $(jq -r '.blocked_plugins // [] | .[] | select(type == "string")' "$CONFIG_FILE"
 EOF
 }
 
+resolve_strict_lifecycle() {
+  local configured="0"
+
+  if [ "${CLAUDE_GUARD_STRICT_LIFECYCLE+x}" = "x" ]; then
+    configured="$CLAUDE_GUARD_STRICT_LIFECYCLE"
+  elif [ -f "$CONFIG_FILE" ] && jq -e 'type == "object" and has("strict_lifecycle")' "$CONFIG_FILE" >/dev/null 2>&1; then
+    if jq -e '(.strict_lifecycle | type) != "boolean"' "$CONFIG_FILE" >/dev/null 2>&1; then
+      printf '配置中的 strict_lifecycle 必须是 true 或 false。\n' >&2
+      exit 2
+    fi
+    configured="$(jq -r 'if .strict_lifecycle == true then "1" else "0" end' "$CONFIG_FILE")"
+  fi
+
+  case "$configured" in
+    1|true|TRUE|yes|YES) STRICT_LIFECYCLE=1 ;;
+    0|false|FALSE|no|NO|"") STRICT_LIFECYCLE=0 ;;
+    *)
+      printf 'CLAUDE_GUARD_STRICT_LIFECYCLE 只能是 0 或 1，当前是: %s\n' "$configured" >&2
+      exit 2
+      ;;
+  esac
+}
+
+resolve_watchdog_strict() {
+  local configured="${CLAUDE_GUARD_WATCHDOG_STRICT:-0}"
+  local signal="${CLAUDE_GUARD_WATCHDOG_STRICT_SIGNAL:-TERM}"
+
+  case "$configured" in
+    1|true|TRUE|yes|YES) WATCHDOG_STRICT=1 ;;
+    0|false|FALSE|no|NO|"") WATCHDOG_STRICT=0 ;;
+    *)
+      printf 'CLAUDE_GUARD_WATCHDOG_STRICT 只能是 0 或 1，当前是: %s\n' "$configured" >&2
+      exit 2
+      ;;
+  esac
+
+  case "$signal" in
+    TERM|term) WATCHDOG_STRICT_SIGNAL="TERM" ;;
+    STOP|stop) WATCHDOG_STRICT_SIGNAL="STOP" ;;
+    *)
+      printf 'CLAUDE_GUARD_WATCHDOG_STRICT_SIGNAL 只能是 TERM 或 STOP，当前是: %s\n' "$signal" >&2
+      exit 2
+      ;;
+  esac
+}
+
+apply_lifecycle_gap() {
+  local headline="$1"
+  local details="$2"
+  local item
+
+  if [ "$STRICT_LIFECYCLE" = "1" ]; then
+    printf '%s\n' "$headline" >&2
+    if [ -n "$details" ]; then
+      printf '%s\n' "$details" | sed 's/^/  - /' >&2
+    fi
+    LIFECYCLE_BLOCK=1
+    return 0
+  fi
+
+  ui_warn '%s' "$headline"
+  if [ -n "$details" ]; then
+    while IFS= read -r item; do
+      [ -n "$item" ] || continue
+      ui_warn '生命周期警告：%s' "$item"
+    done <<EOF
+$details
+EOF
+  fi
+}
+
 check_official_settings_policy() {
   local missing risk_paths pinned_model
+
+  if [ "$STRICT_LIFECYCLE" = "1" ]; then
+    ui_note '生命周期模式：strict。能力项不满足时，网络检查完成后拒绝启动。'
+  else
+    ui_note '生命周期模式：warn。hooks、插件和后台能力默认不拦截。'
+  fi
+
+  if [ ! -f "$OFFICIAL_SETTINGS" ]; then
+    apply_lifecycle_gap \
+      "官方 settings 不存在，生命周期策略无法核对: ${OFFICIAL_SETTINGS}" \
+      ""
+    ui_note '网络检查（出口白名单、代理隧道、TLS、IPv6）仍会执行。'
+    return 0
+  fi
 
   validate_json_file "$OFFICIAL_SETTINGS" "官方 settings"
 
@@ -625,13 +740,20 @@ check_official_settings_policy() {
   ' "$OFFICIAL_SETTINGS")"
 
   if [ -n "$missing" ]; then
-    printf '官方 settings 未满足 v%s 生命周期策略，已拒绝启动: %s\n' "$VERSION" "$OFFICIAL_SETTINGS" >&2
-    printf '%s\n' "$missing" | sed 's/^/  - /' >&2
-    exit 13
+    if [ "$STRICT_LIFECYCLE" = "1" ]; then
+      apply_lifecycle_gap \
+        "官方 settings 未满足 v${VERSION} 生命周期策略，网络检查完成后将拒绝启动: ${OFFICIAL_SETTINGS}" \
+        "$missing"
+    else
+      apply_lifecycle_gap \
+        "生命周期警告：未满足 v${VERSION} 生命周期策略，默认不拦截: ${OFFICIAL_SETTINGS}" \
+        "$missing"
+    fi
+  else
+    ui_note '生命周期策略通过：当前 settings 仍关闭脱离终端的会话、排程、工作流、Remote Control 与自动更新。'
   fi
 
   check_blocked_plugins "$OFFICIAL_SETTINGS" "官方 settings"
-  ui_note '生命周期策略通过：TUI 内后台任务可用；脱离终端的会话、排程、工作流、Remote Control 与自动更新均已关闭。'
 }
 
 project_settings_files() {
@@ -678,9 +800,15 @@ check_project_settings_policy() {
       | .[]
     ' "$file")"
     if [ -n "$unsafe" ]; then
-      printf '项目设置试图降低生命周期保护，已拒绝启动: %s\n' "$file" >&2
-      printf '%s\n' "$unsafe" | sed 's/^/  - /' >&2
-      exit 13
+      if [ "$STRICT_LIFECYCLE" = "1" ]; then
+        apply_lifecycle_gap \
+          "项目设置试图降低生命周期保护，网络检查完成后将拒绝启动: ${file}" \
+          "$unsafe"
+      else
+        apply_lifecycle_gap \
+          "生命周期警告：项目设置降低了能力限制，默认不拦截: ${file}" \
+          "$unsafe"
+      fi
     fi
 
     check_blocked_plugins "$file" "项目设置"
@@ -703,16 +831,25 @@ check_cli_policy() {
         exit 13
         ;;
       --bg|--bg=*|--background|--background=*|agents|attach|respawn)
-        printf '后台会话已禁用；请在当前前台终端中运行 Claude。\n' >&2
-        exit 13
+        if [ "$STRICT_LIFECYCLE" = "1" ]; then
+          apply_lifecycle_gap "后台会话已禁用；请在当前前台终端中运行 Claude。" ""
+        else
+          apply_lifecycle_gap "生命周期警告：命令行请求后台会话，默认不拦截: ${arg}" ""
+        fi
         ;;
       --tmux|--tmux=*)
-        printf '受守护入口不允许启动脱离当前终端的 tmux/iTerm2 会话。\n' >&2
-        exit 13
+        if [ "$STRICT_LIFECYCLE" = "1" ]; then
+          apply_lifecycle_gap "受守护入口不允许启动脱离当前终端的 tmux/iTerm2 会话。" ""
+        else
+          apply_lifecycle_gap "生命周期警告：命令行请求 tmux 会话，默认不拦截。" ""
+        fi
         ;;
       --remote-control|--remote-control=*|remote-control)
-        printf 'Remote Control 已禁用；官方 Claude 必须留在受守护的前台终端中。\n' >&2
-        exit 13
+        if [ "$STRICT_LIFECYCLE" = "1" ]; then
+          apply_lifecycle_gap "Remote Control 已禁用；官方 Claude 必须留在受守护的前台终端中。" ""
+        else
+          apply_lifecycle_gap "生命周期警告：命令行请求 Remote Control，默认不拦截。" ""
+        fi
         ;;
     esac
   done
@@ -1142,12 +1279,17 @@ print_status_report() {
   local profile_display log_display log_bytes last_incident last_recovery
 
   load_visibility_config
+  resolve_watchdog_strict
+  resolve_strict_lifecycle
   rows="$(visibility_session_rows)"
   active_count="$(printf '%s\n' "$rows" | awk 'NF { count += 1 } END { print count + 0 }')"
   watchdog_count="$(printf '%s\n' "$rows" | awk -F '\t' 'NF { count += $3 } END { print count + 0 }')"
   mode="action-refused"
   mode_label="action requested (refused at launch)"
-  if [ "$WATCHDOG_DRY_RUN" = "1" ]; then
+  if [ "$WATCHDOG_STRICT" = "1" ]; then
+    mode="strict"
+    mode_label="strict signal ${WATCHDOG_STRICT_SIGNAL}"
+  elif [ "$WATCHDOG_DRY_RUN" = "1" ]; then
     mode="dry-run"
     mode_label="dry-run observation"
   fi
@@ -1186,11 +1328,13 @@ print_status_report() {
       --argjson active_sessions "$active_count" \
       --argjson active_watchdogs "$watchdog_count" \
       --argjson log_bytes "$log_bytes" \
+      --arg lifecycle "$([ "$STRICT_LIFECYCLE" = "1" ] && printf strict || printf warn)" \
       --argjson sessions "$sessions_json" \
       '{
         version: $version,
         health: $health,
         mode: $mode,
+        lifecycle: $lifecycle,
         notifications: $notifications,
         config_state: $config_state,
         proxy: $proxy,
@@ -1214,8 +1358,14 @@ print_status_report() {
   printf '  config: %s\n' "$VISIBILITY_CONFIG_STATE"
   printf '  profile: %s\n' "$profile_display"
   printf '  proxy: %s\n' "$CLAUDE_PROXY_URL"
+  printf '  lifecycle: %s\n' "$([ "$STRICT_LIFECYCLE" = "1" ] && printf strict || printf warn)"
   printf '  active Claude sessions: %s\n' "$active_count"
   printf '  active watchdogs: %s\n' "$watchdog_count"
+  if [ -f "$LAUNCH_BLOCK_FILE" ]; then
+    printf '  launch block: %s\n' "$(awk -F= '/^reason=/ { print substr($0, 8); exit }' "$LAUNCH_BLOCK_FILE")"
+  else
+    printf '  launch block: none\n'
+  fi
   printf '  log: %s (%s bytes including archive)\n' "$log_display" "$log_bytes"
   printf 'Sessions:\n'
   if [ -z "$rows" ]; then
@@ -1528,6 +1678,7 @@ get_current_ip_once() {
     # 裸 IP 响应体，例如 https://api.ipify.org。
     ip="$(printf '%s' "$raw" | tr -d '[:space:]')"
     if is_ipv4 "$ip"; then
+      CURRENT_IP_SOURCE="$url"
       printf '%s\n' "$ip"
       return 0
     fi
@@ -1535,6 +1686,7 @@ get_current_ip_once() {
     # Cloudflare /cdn-cgi/trace 响应体：形如 ip=203.0.113.10 的 key=value 多行文本。
     ip="$(printf '%s\n' "$raw" | awk -F= '/^ip=/ { print $2; exit }' | tr -d '[:space:]')"
     if is_ipv4 "$ip"; then
+      CURRENT_IP_SOURCE="$url"
       printf '%s\n' "$ip"
       return 0
     fi
@@ -1583,12 +1735,83 @@ watchdog_signal_exit() {
   exit 0
 }
 
+write_launch_block() {
+  local reason="$1"
+  local action="$2"
+  local dir
+
+  dir="$(dirname "$LAUNCH_BLOCK_FILE")"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  printf 'reason=%s\naction=%s\n' "$reason" "$action" >"$LAUNCH_BLOCK_FILE" 2>/dev/null || true
+}
+
+clear_launch_block() {
+  rm -f "$LAUNCH_BLOCK_FILE" 2>/dev/null || true
+}
+
+signal_target_tree() {
+  local root="$1"
+  local sig="$2"
+  local self snapshot pids pid
+
+  case "$root" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$root" -gt 1 ] || return 1
+  # $$ 在后台子 shell 里仍是父进程。看门狗自己的 PID 要用 BASHPID，
+  # bash 3.2 没有 BASHPID，退回到子 sh 的 PPID。
+  if [ -n "${BASHPID:-}" ] && [ "$BASHPID" != "$$" ]; then
+    self="$BASHPID"
+  else
+    self="$(sh -c 'echo "$PPID"')"
+  fi
+  snapshot="$(ps -axo pid=,ppid= 2>/dev/null || true)"
+  pids="$(printf '%s\n' "$snapshot" | awk -v root="$root" -v self="$self" '
+    NF >= 2 {
+      pid = $1
+      ppid = $2
+      parent[pid] = ppid
+      pids[++n] = pid
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        p = pids[i]
+        if (p == self || p == root || p == 1) continue
+        cur = p
+        for (hop = 0; hop < 30; hop++) {
+          if (cur == root) { print p; break }
+          if (cur == "" || cur == 0 || cur == 1) break
+          cur = parent[cur]
+        }
+      }
+    }
+  ')"
+  while IFS= read -r pid; do
+    [ -n "$pid" ] || continue
+    kill "-${sig}" "$pid" 2>/dev/null || true
+  done <<EOF
+$pids
+EOF
+  if [ "$root" != "$self" ]; then
+    kill "-${sig}" "$root" 2>/dev/null || true
+  fi
+}
+
 pause_target() {
   local target_pid="$1"
   local reason="$2"
 
+  write_launch_block "$reason" "block-new-launches"
+  if [ "$WATCHDOG_STRICT" = "1" ]; then
+    log_guard "ERROR" "strict action: signal=${WATCHDOG_STRICT_SIGNAL} pid=${target_pid}; reason=${reason}; existing session targeted"
+    notify_guard "Strict: ${WATCHDOG_STRICT_SIGNAL} Claude pid ${target_pid} because ${reason}"
+    signal_target_tree "$target_pid" "$WATCHDOG_STRICT_SIGNAL"
+    return 0
+  fi
+
   if [ "$WATCHDOG_DRY_RUN" = "1" ]; then
     log_guard "WARN" "DRY RUN: would pause Claude pid=${target_pid}; reason=${reason}"
+    log_guard "WARN" "existing session left running pid=${target_pid}; new launches blocked by egress precheck"
     if [ "$DRY_RUN_STDERR" = "1" ]; then
       printf '\nClaude Guardian dry-run: would pause Claude because %s\n' "$reason" >&2
     fi
@@ -1596,14 +1819,26 @@ pause_target() {
     return 0
   fi
 
-  printf 'Claude Guardian action mode is disabled in v%s because this launcher preserves Claude as the foreground TUI process and cannot safely pause the whole process group yet. Keep CLAUDE_GUARD_WATCHDOG_DRY_RUN=1.\n' "$VERSION" >&2
-  log_guard "ERROR" "action mode refused; unsafe to pause only pid=${target_pid}; reason=${reason}"
+  printf 'Claude Guardian 不会在未设置 CLAUDE_GUARD_WATCHDOG_STRICT=1 时暂停或结束已有会话。\n' >&2
+  log_guard "ERROR" "action mode refused; existing session left running pid=${target_pid}; reason=${reason}"
   return 1
 }
 
 resume_target() {
   local target_pid="$1"
   local reason="$2"
+
+  clear_launch_block
+  if [ "$WATCHDOG_STRICT" = "1" ]; then
+    if [ "$WATCHDOG_STRICT_SIGNAL" = "STOP" ]; then
+      log_guard "INFO" "strict action: signal=CONT pid=${target_pid}; reason=${reason}"
+      signal_target_tree "$target_pid" "CONT"
+    else
+      log_guard "INFO" "strict action: process was signaled TERM pid=${target_pid}; resume requires a new launch; reason=${reason}"
+    fi
+    notify_guard "Strict: would resume Claude pid ${target_pid} because ${reason}"
+    return 0
+  fi
 
   if [ "$WATCHDOG_DRY_RUN" = "1" ]; then
     log_guard "INFO" "DRY RUN: would resume Claude pid=${target_pid}; reason=${reason}"
@@ -1712,8 +1947,14 @@ run_watchdog() {
       if [ -n "$KILL_AFTER_PAUSE_SECONDS" ] && [ "$paused_since" -gt 0 ] && \
          [ $((now - paused_since)) -ge "$KILL_AFTER_PAUSE_SECONDS" ] && \
          [ "$kill_notice_logged" -eq 0 ]; then
-        watchdog_log "$target_pid" "ERROR" \
-          "kill-after-pause reached but automatic kill is not implemented in v${VERSION}"
+        if [ "$WATCHDOG_STRICT" = "1" ] && [ "$WATCHDOG_STRICT_SIGNAL" = "STOP" ]; then
+          watchdog_log "$target_pid" "ERROR" \
+            "strict action: signal=TERM pid=${target_pid}; kill-after-pause reached"
+          signal_target_tree "$target_pid" "TERM"
+        else
+          watchdog_log "$target_pid" "ERROR" \
+            "kill-after-pause reached; observe mode does not signal existing sessions pid=${target_pid}"
+        fi
         kill_notice_logged=1
       fi
 
@@ -1808,13 +2049,670 @@ start_watchdog_sidecar() {
     return 0
   fi
 
-  if [ "$WATCHDOG_DRY_RUN" != "1" ]; then
-    printf 'Claude Guardian action mode is not enabled in v%s. This version defaults to dry-run observation so it cannot accidentally pause only the main PID.\n' "$VERSION" >&2
-    printf 'Please use CLAUDE_GUARD_WATCHDOG_DRY_RUN=1, observe logs, and enable real pause/resume after process-group runner support lands.\n' >&2
+  resolve_watchdog_strict
+  if [ "$WATCHDOG_STRICT" != "1" ] && [ "$WATCHDOG_DRY_RUN" != "1" ]; then
+    printf 'Claude Guardian action mode is not enabled in v%s. Existing sessions stay running unless CLAUDE_GUARD_WATCHDOG_STRICT=1.\n' "$VERSION" >&2
+    printf 'Please use CLAUDE_GUARD_WATCHDOG_DRY_RUN=1, or set CLAUDE_GUARD_WATCHDOG_STRICT=1 to signal the watched process tree.\n' >&2
     exit 9
   fi
 
   run_watchdog "$$" &
+}
+
+exec_claude() {
+  # exec 只能替换成外部命令，不能调用函数。数组始终非空，避免 bash 3.2
+  # 在 set -u 下展开空数组。
+  local -a env_args
+  env_args=(
+    "HOME=${HOME}"
+    "USER=${USER:-user}"
+    "PATH=${PATH}"
+    "TERM=${TERM:-xterm-256color}"
+    "LANG=${LANG:-en_US.UTF-8}"
+    "LC_ALL=${LC_ALL:-en_US.UTF-8}"
+    "SHELL=${SHELL:-/bin/zsh}"
+    "HTTP_PROXY=${CLAUDE_PROXY_URL}"
+    "HTTPS_PROXY=${CLAUDE_PROXY_URL}"
+    "ALL_PROXY=${CLAUDE_PROXY_URL}"
+    "http_proxy=${CLAUDE_PROXY_URL}"
+    "https_proxy=${CLAUDE_PROXY_URL}"
+    "all_proxy=${CLAUDE_PROXY_URL}"
+    "NO_PROXY=${NO_PROXY_LIST}"
+    "no_proxy=${NO_PROXY_LIST}"
+    "CLAUDE_CONFIG_DIR=${OFFICIAL_CONFIG_DIR}"
+    "DISABLE_AUTOUPDATER=1"
+    "DISABLE_ERROR_REPORTING=1"
+    "DISABLE_FEEDBACK_COMMAND=1"
+    "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY=1"
+    "DISABLE_UPDATES=1"
+    "CLAUDE_CODE_CERT_STORE=system"
+    "SSL_CERT_FILE=${CA_CERT_FILE}"
+    "NODE_EXTRA_CA_CERTS=${CA_CERT_FILE}"
+  )
+  if [ "$STRICT_LIFECYCLE" = "1" ]; then
+    env_args+=(
+      "CLAUDE_CODE_DISABLE_AGENT_VIEW=1"
+      "CLAUDE_CODE_DISABLE_CRON=1"
+      "CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF=1"
+      "CLAUDE_DISABLE_ADOPT=1"
+      "CLAUDE_CODE_DISABLE_WORKFLOWS=1"
+      "CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0"
+      "CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1"
+      "CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS=3"
+    )
+  fi
+  if [ -f "$OFFICIAL_SETTINGS" ]; then
+    exec env -i "${env_args[@]}" \
+      "$CLAUDE_BIN" \
+      --setting-sources=user,project \
+      --settings "$OFFICIAL_SETTINGS" \
+      "$@"
+  fi
+  exec env -i "${env_args[@]}" \
+    "$CLAUDE_BIN" \
+    "$@"
+}
+
+resolve_mihomo_strict() {
+  local configured="0"
+
+  if [ "${CLAUDE_GUARD_MIHOMO_STRICT+x}" = "x" ]; then
+    configured="$CLAUDE_GUARD_MIHOMO_STRICT"
+  elif [ -f "$CONFIG_FILE" ] && jq -e '.mihomo.strict != null and (.mihomo.strict | type) != "boolean"' "$CONFIG_FILE" >/dev/null 2>&1; then
+    printf '配置中的 mihomo.strict 必须是 true 或 false。\n' >&2
+    exit 2
+  elif [ -f "$CONFIG_FILE" ] && jq -e '.mihomo.strict == true' "$CONFIG_FILE" >/dev/null 2>&1; then
+    configured="1"
+  fi
+
+  case "$configured" in
+    1|true|TRUE|yes|YES) MIHOMO_STRICT=1 ;;
+    0|false|FALSE|no|NO|"") MIHOMO_STRICT=0 ;;
+    *)
+      printf 'CLAUDE_GUARD_MIHOMO_STRICT 只能是 0 或 1，当前是: %s\n' "$configured" >&2
+      exit 2
+      ;;
+  esac
+}
+
+mihomo_mark_finding() {
+  MIHOMO_FINDINGS=1
+  if [ "$MIHOMO_STRICT" = "1" ]; then
+    DOCTOR_BLOCK=1
+  fi
+}
+
+mihomo_get() {
+  local path="$1"
+  local dest="$2"
+
+  if [ "$MIHOMO_KIND" = "unix" ]; then
+    curl -q -X GET --noproxy '*' --unix-socket "$MIHOMO_SOCKET" \
+      -fsS --connect-timeout 2 --max-time 5 \
+      -o "$dest" \
+      "http://localhost${path}"
+    return $?
+  fi
+  if [ -n "$MIHOMO_SECRET" ]; then
+    curl -q -X GET --noproxy '*' \
+      -fsS --connect-timeout 2 --max-time 5 \
+      -H "Authorization: Bearer ${MIHOMO_SECRET}" \
+      -o "$dest" \
+      "${MIHOMO_HTTP_BASE}${path}"
+    return $?
+  fi
+  curl -q -X GET --noproxy '*' \
+    -fsS --connect-timeout 2 --max-time 5 \
+    -o "$dest" \
+    "${MIHOMO_HTTP_BASE}${path}"
+}
+
+match_domain_proxy() {
+  local domain="$1"
+  local rules_file="$2"
+  local type payload proxy
+
+  while IFS=$'\037' read -r type payload proxy; do
+    [ -n "$type" ] || continue
+    case "$type" in
+      Domain|DOMAIN)
+        if [ "$payload" = "$domain" ]; then
+          printf '%s\n' "$proxy"
+          return 0
+        fi
+        ;;
+      DomainSuffix|DOMAIN-SUFFIX)
+        if [ "$domain" = "$payload" ]; then
+          printf '%s\n' "$proxy"
+          return 0
+        fi
+        case "$domain" in
+          *."$payload")
+            printf '%s\n' "$proxy"
+            return 0
+            ;;
+        esac
+        ;;
+      DomainKeyword|DOMAIN-KEYWORD)
+        case "$domain" in
+          *"$payload"*)
+            printf '%s\n' "$proxy"
+            return 0
+            ;;
+        esac
+        ;;
+      Match|MATCH)
+        printf '%s\n' "$proxy"
+        return 0
+        ;;
+    esac
+  done <"$rules_file"
+  printf 'UNCOVERED\n'
+}
+
+report_mihomo() {
+  local api sock report_dir rules_file proxies_file configs_file conn_file allow_file
+  local expect_group covered total proxy domain member typ now all_csv
+  local groups_file group direct_members extra_members selected
+
+  resolve_mihomo_strict
+  MIHOMO_FINDINGS=0
+  MIHOMO_KIND=""
+  MIHOMO_SOCKET=""
+  MIHOMO_HTTP_BASE=""
+  MIHOMO_SECRET="${CLAUDE_GUARD_MIHOMO_SECRET:-}"
+  MIHOMO_SELECTED_NODE=""
+  api=""
+  expect_group=""
+  if [ -z "$MIHOMO_SECRET" ] && [ -f "$CONFIG_FILE" ]; then
+    MIHOMO_SECRET="$(jq -r '.mihomo.secret // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  if [ "${CLAUDE_GUARD_MIHOMO_API+x}" = "x" ]; then
+    api="$CLAUDE_GUARD_MIHOMO_API"
+  elif [ -f "$CONFIG_FILE" ]; then
+    api="$(jq -r '.mihomo.api // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  if [ -f "$CONFIG_FILE" ]; then
+    expect_group="$(jq -r '.mihomo.group // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  if [ -z "$api" ]; then
+    sock="/var/run/clash-verge-service/users/$(id -u)/verge-mihomo.sock"
+    if [ -S "$sock" ]; then
+      api="unix://${sock}"
+    fi
+  fi
+
+  printf 'Mihomo（只读）:\n'
+  if [ -z "$api" ]; then
+    printf '  控制器: 未配置，且未发现 verge-mihomo.sock\n'
+    printf '  说明: 跳过只读查询。本工具不会修改 Clash 配置或订阅。\n'
+    return 0
+  fi
+  case "$api" in
+    unix://*)
+      MIHOMO_KIND="unix"
+      MIHOMO_SOCKET="${api#unix://}"
+      ;;
+    http://*|https://*)
+      MIHOMO_KIND="http"
+      MIHOMO_HTTP_BASE="${api%/}"
+      ;;
+    *)
+      printf '  控制器: 无法识别\n'
+      printf '  警告: mihomo.api 必须以 unix://、http:// 或 https:// 开头。\n'
+      mihomo_mark_finding
+      return 0
+      ;;
+  esac
+  printf '  控制器: %s\n' "$api"
+
+  report_dir="$(mktemp -d "${TMPDIR:-/tmp}/claude-guard-mihomo.XXXXXX")"
+  rules_file="${report_dir}/rules.tsv"
+  proxies_file="${report_dir}/proxies.json"
+  configs_file="${report_dir}/configs.json"
+  conn_file="${report_dir}/connections.json"
+  allow_file="${report_dir}/allowed-nodes"
+  groups_file="${report_dir}/groups"
+  : >"$groups_file"
+  if [ -f "$CONFIG_FILE" ]; then
+    jq -r '.mihomo.allowed_nodes // [] | .[]' "$CONFIG_FILE" >"$allow_file" 2>/dev/null || : >"$allow_file"
+  else
+    : >"$allow_file"
+  fi
+
+  if ! mihomo_get /configs "$configs_file" >/dev/null 2>&1; then
+    printf '  可达: no\n'
+    printf '  说明: 控制器查询失败。未修改 Clash 配置或订阅。\n'
+    rm -rf "$report_dir"
+    return 0
+  fi
+  printf '  可达: yes\n'
+  mihomo_get /proxies "$proxies_file" >/dev/null 2>&1 || printf '{}\n' >"$proxies_file"
+  mihomo_get /rules "$report_dir/rules.json" >/dev/null 2>&1 || printf '{"rules":[]}\n' >"$report_dir/rules.json"
+  mihomo_get /connections "$conn_file" >/dev/null 2>&1 || printf '{"connections":[]}\n' >"$conn_file"
+  MIHOMO_CONN_JSON="$conn_file"
+
+  jq -r '
+    def tun: if (.tun | type) == "object" then .tun else {} end;
+    [
+      (if (tun | has("enable")) then tun.enable else false end | tostring),
+      (if (tun | has("strict-route")) then tun["strict-route"]
+        elif (tun | has("strict_route")) then tun.strict_route
+        elif (tun | has("strictRoute")) then tun.strictRoute
+        else "absent" end | tostring),
+      (tun.stack // ""),
+      (if (.dns | type) == "object" and (.dns | has("enhanced-mode")) then .dns["enhanced-mode"]
+        elif (.dns | type) == "object" and (.dns | has("enhanced_mode")) then .dns.enhanced_mode
+        else "absent" end | tostring),
+      (if has("ipv6") then .ipv6 else "absent" end | tostring)
+    ] | join("\u001f")
+  ' "$configs_file" 2>/dev/null | {
+    IFS=$'\037' read -r tun_enable strict_route tun_stack dns_mode ipv6_mode || true
+    printf '  tun.enable: %s\n' "${tun_enable:-unknown}"
+    printf '  tun.strict-route: %s\n' "${strict_route:-unknown}"
+    printf '  tun.stack: %s\n' "${tun_stack:-}"
+    printf '  dns.enhanced-mode: %s\n' "${dns_mode:-unknown}"
+    printf '  ipv6: %s\n' "${ipv6_mode:-unknown}"
+    if [ "${tun_enable:-false}" != "true" ]; then
+      printf '  警告: TUN 未开启。\n'
+      mihomo_mark_finding
+    fi
+    if [ "${strict_route:-false}" != "true" ]; then
+      printf '  警告: tun.strict-route 未开启，开机或重启时流量可能绕过 TUN。\n'
+      mihomo_mark_finding
+    fi
+  } || true
+
+  # The pipeline above runs mihomo_mark_finding in a subshell. Re-read the printed
+  # warnings is unreliable, so evaluate the same fields in the current shell.
+  strict_route="$(jq -r '
+    def tun: if (.tun | type) == "object" then .tun else {} end;
+    if (tun | has("strict-route")) then tun["strict-route"]
+    elif (tun | has("strict_route")) then tun.strict_route
+    elif (tun | has("strictRoute")) then tun.strictRoute
+    else "absent" end | tostring
+  ' "$configs_file" 2>/dev/null || printf 'absent')"
+  tun_enable="$(jq -r '(.tun.enable // false) | tostring' "$configs_file" 2>/dev/null || printf 'false')"
+  if [ "$tun_enable" != "true" ]; then
+    mihomo_mark_finding
+  fi
+  if [ "$strict_route" != "true" ]; then
+    mihomo_mark_finding
+  fi
+
+  jq -r '
+    (if type == "array" then . elif (.rules | type) == "array" then .rules else [] end)
+    | .[]
+    | [(.type // ""), (.payload // ""), (.proxy // .policy // "")]
+    | join("\u001f")
+  ' "$report_dir/rules.json" >"$rules_file" 2>/dev/null || : >"$rules_file"
+
+  covered=0
+  total=0
+  while IFS= read -r domain; do
+    [ -n "$domain" ] || continue
+    total=$((total + 1))
+    proxy="$(match_domain_proxy "$domain" "$rules_file")"
+    case "$proxy" in
+      UNCOVERED)
+        printf '  未覆盖: %s\n' "$domain"
+        mihomo_mark_finding
+        ;;
+      DIRECT|Direct|direct)
+        printf '  命中 DIRECT: %s\n' "$domain"
+        mihomo_mark_finding
+        ;;
+      *)
+        if [ -n "$expect_group" ] && [ "$proxy" != "$expect_group" ]; then
+          printf '  未命中期望组: %s -> %s（期望 %s）\n' "$domain" "$proxy" "$expect_group"
+          mihomo_mark_finding
+        else
+          covered=$((covered + 1))
+          printf '%s\n' "$proxy" >>"$groups_file"
+        fi
+        ;;
+    esac
+  done <<'EOF'
+api.anthropic.com
+claude.ai
+claude.com
+platform.claude.com
+sso.claude.com
+downloads.claude.ai
+mcp-proxy.anthropic.com
+assets-proxy.anthropic.com
+bridge.claudeusercontent.com
+cdn.claudemcpcontent.com
+EOF
+  printf '  已覆盖: %s/%s 个必需域名\n' "$covered" "$total"
+
+  while IFS= read -r domain; do
+    [ -n "$domain" ] || continue
+    proxy="$(match_domain_proxy "$domain" "$rules_file")"
+    case "$proxy" in
+      UNCOVERED|DIRECT|Direct|direct)
+        printf '  遥测未覆盖: %s\n' "$domain"
+        ;;
+      *)
+        if [ -n "$expect_group" ] && [ "$proxy" != "$expect_group" ]; then
+          printf '  遥测未覆盖: %s -> %s\n' "$domain" "$proxy"
+        else
+          printf '%s\n' "$proxy" >>"$groups_file"
+        fi
+        ;;
+    esac
+  done <<'EOF'
+http-intake.logs.us5.datadoghq.com
+browser-intake-us5-datadoghq.com
+EOF
+
+  if [ -n "$expect_group" ]; then
+    printf '%s\n' "$expect_group" >>"$groups_file"
+  fi
+  sort -u "$groups_file" | while IFS= read -r group; do
+    [ -n "$group" ] || continue
+    if ! jq -e --arg name "$group" '.proxies[$name] != null' "$proxies_file" >/dev/null 2>&1; then
+      continue
+    fi
+    now="$(jq -r --arg name "$group" '.proxies[$name].now // ""' "$proxies_file" 2>/dev/null || true)"
+    typ="$(jq -r --arg name "$group" '.proxies[$name].type // ""' "$proxies_file" 2>/dev/null || true)"
+    all_csv="$(jq -r --arg name "$group" '(.proxies[$name].all // []) | join(",")' "$proxies_file" 2>/dev/null || true)"
+    case "$typ" in
+      Selector|URLTest|Fallback|LoadBalance|Select|Relay) ;;
+      *) continue ;;
+    esac
+    printf '  规则命中组: %s\n' "$group"
+    printf '  组类型: %s\n' "$typ"
+    printf '  选中节点: %s\n' "${now:-unknown}"
+    printf '  组成员: %s\n' "${all_csv:-}"
+    if [ -z "$MIHOMO_SELECTED_NODE" ] && [ -n "$now" ]; then
+      MIHOMO_SELECTED_NODE="$now"
+    fi
+    direct_members=""
+    extra_members=""
+    IFS=','
+    # shellcheck disable=SC2086 # comma-separated member list; IFS is comma here
+    for member in $all_csv; do
+      [ -n "$member" ] || continue
+      case "$member" in
+        REJECT|Reject|reject) continue ;;
+      esac
+      selected="$(jq -r --arg name "$member" '.proxies[$name].type // empty' "$proxies_file" 2>/dev/null || true)"
+      case "$member" in
+        DIRECT|Direct|direct)
+          direct_members="${direct_members} ${member}"
+          continue
+          ;;
+      esac
+      case "$selected" in
+        Direct|direct|DIRECT)
+          direct_members="${direct_members} ${member}"
+          continue
+          ;;
+      esac
+      if [ -s "$allow_file" ]; then
+        if ! grep -Fxq "$member" "$allow_file"; then
+          extra_members="${extra_members} ${member}"
+        fi
+      fi
+    done
+    unset IFS
+    if [ -n "$direct_members" ]; then
+      printf '  警告: 组内包含 DIRECT:%s\n' "$direct_members"
+      mihomo_mark_finding
+    fi
+    if [ -n "$now" ]; then
+      case "$now" in
+        DIRECT|Direct|direct)
+          printf '  警告: 当前选中节点是 DIRECT。\n'
+          mihomo_mark_finding
+          ;;
+      esac
+      if [ -s "$allow_file" ] && ! grep -Fxq "$now" "$allow_file"; then
+        printf '  警告: 选中节点不在 allowed_nodes 中: %s\n' "$now"
+        mihomo_mark_finding
+      fi
+    fi
+    if [ -n "$extra_members" ]; then
+      printf '  警告: 组内包含未列入 allowed_nodes 的节点:%s\n' "$extra_members"
+      mihomo_mark_finding
+    elif [ ! -s "$allow_file" ]; then
+      printf '  说明: 未配置 allowed_nodes，只检查 DIRECT。\n'
+    fi
+  done
+
+  # sort|while is a pipeline, so finding flags set inside it are lost.
+  # Re-scan groups in the current shell.
+  while IFS= read -r group; do
+    [ -n "$group" ] || continue
+    jq -e --arg name "$group" '.proxies[$name].type as $t | ["Selector","URLTest","Fallback","LoadBalance","Select","Relay"] | index($t)' \
+      "$proxies_file" >/dev/null 2>&1 || continue
+    now="$(jq -r --arg name "$group" '.proxies[$name].now // ""' "$proxies_file" 2>/dev/null || true)"
+    all_csv="$(jq -r --arg name "$group" '(.proxies[$name].all // []) | join(",")' "$proxies_file" 2>/dev/null || true)"
+    if [ -z "$MIHOMO_SELECTED_NODE" ] && [ -n "$now" ]; then
+      MIHOMO_SELECTED_NODE="$now"
+    fi
+    case "$now" in
+      DIRECT|Direct|direct) mihomo_mark_finding ;;
+    esac
+    if [ -n "$now" ] && [ -s "$allow_file" ] && ! grep -Fxq "$now" "$allow_file"; then
+      mihomo_mark_finding
+    fi
+    old_ifs="$IFS"
+    IFS=','
+    # shellcheck disable=SC2086 # comma-separated member list; IFS is comma here
+    for member in $all_csv; do
+      [ -n "$member" ] || continue
+      case "$member" in
+        REJECT|Reject|reject) continue ;;
+        DIRECT|Direct|direct) mihomo_mark_finding; continue ;;
+      esac
+      selected="$(jq -r --arg name "$member" '.proxies[$name].type // empty' "$proxies_file" 2>/dev/null || true)"
+      case "$selected" in
+        Direct|direct|DIRECT) mihomo_mark_finding; continue ;;
+      esac
+      if [ -s "$allow_file" ] && ! grep -Fxq "$member" "$allow_file"; then
+        mihomo_mark_finding
+      fi
+    done
+    IFS="$old_ifs"
+  done <<EOF
+$(sort -u "$groups_file")
+EOF
+
+  if [ "$MIHOMO_FINDINGS" = "1" ]; then
+    printf '  结论: 有告警。默认只警告；CLAUDE_GUARD_MIHOMO_STRICT=1 时 doctor 拒绝启动。\n'
+  else
+    printf '  结论: 未发现 DIRECT、必需域名缺口或 strict-route 关闭。\n'
+  fi
+  printf '  说明: 以上为只读查询，未修改 Clash 配置或订阅。\n'
+  # Keep the connection snapshot for the desktop section, drop the rest.
+  if [ -f "$conn_file" ]; then
+    cp "$conn_file" "${report_dir}.connections.json"
+    MIHOMO_CONN_JSON="${report_dir}.connections.json"
+  fi
+  rm -rf "$report_dir"
+}
+
+print_clash_snippet() {
+  local node group
+
+  node="${MIHOMO_SELECTED_NODE:-}"
+  if [ -z "$node" ] || [ "$node" = "DIRECT" ] || [ "$node" = "REJECT" ]; then
+    if [ -f "$CONFIG_FILE" ]; then
+      node="$(jq -r '.mihomo.allowed_nodes[0] // empty' "$CONFIG_FILE" 2>/dev/null || true)"
+    fi
+  fi
+  [ -n "$node" ] || node="YOUR_NODE"
+  group="ClaudeAI"
+  if [ -f "$CONFIG_FILE" ]; then
+    group="$(jq -r '.mihomo.group // "ClaudeAI"' "$CONFIG_FILE" 2>/dev/null || printf 'ClaudeAI')"
+    [ -n "$group" ] || group="ClaudeAI"
+  fi
+
+  cat <<EOF
+建议 Clash 片段（未写入任何配置文件或订阅）:
+# 把节点名换成 ClaudeAI 组里唯一允许的出口。不要把 DIRECT 或其他机场节点放进该组。
+proxy-groups:
+  - name: ${group}
+    type: select
+    proxies:
+      - ${node}
+      - REJECT
+
+tun:
+  enable: true
+  stack: gvisor
+  auto-route: true
+  strict-route: true
+  dns-hijack:
+    - any:53
+
+rules:
+  - DOMAIN-SUFFIX,anthropic.com,${group}
+  - DOMAIN-SUFFIX,claude.ai,${group}
+  - DOMAIN-SUFFIX,claude.com,${group}
+  - DOMAIN-SUFFIX,claudeusercontent.com,${group}
+  - DOMAIN-SUFFIX,claudemcpcontent.com,${group}
+  - DOMAIN,platform.claude.com,${group}
+  - DOMAIN,sso.claude.com,${group}
+  - DOMAIN,mcp-proxy.anthropic.com,${group}
+  - DOMAIN,downloads.claude.ai,${group}
+  - DOMAIN,http-intake.logs.us5.datadoghq.com,${group}
+  - DOMAIN,browser-intake-us5-datadoghq.com,${group}
+  - PROCESS-NAME,Claude,${group}
+  - PROCESS-NAME,claude,${group}
+EOF
+}
+
+report_desktop() {
+  local line pid command app_count bundled_count proxy_port bundle_root dir base
+  local login_out login_pid waited conn_note
+
+  printf '桌面端:\n'
+  app_count=0
+  bundled_count=0
+  proxy_port="${CLAUDE_PROXY_URL##*:}"
+  proxy_port="${proxy_port%%/*}"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    pid="${line%% *}"
+    command="${line#"$pid"}"
+    command="${command#" "}"
+    case "$command" in
+      *Claude.app/Contents/MacOS/Claude*)
+        app_count=$((app_count + 1))
+        printf '  Claude.app 进程: pid=%s\n' "$pid"
+        if command -v lsof >/dev/null 2>&1; then
+          if lsof -nP -p "$pid" -iTCP -sTCP:ESTABLISHED 2>/dev/null | grep -F ":${proxy_port}" >/dev/null; then
+            printf '  连接: pid=%s 观察到混合端口 %s\n' "$pid" "$proxy_port"
+          else
+            printf '  连接: pid=%s 未观察到混合端口 %s。TUN 开启时 lsof 仍可能显示公网地址，需对照 mihomo connections。\n' "$pid" "$proxy_port"
+          fi
+        fi
+        ;;
+      *"/Claude/claude-code/"*)
+        bundled_count=$((bundled_count + 1))
+        printf '  捆绑 claude-code 进程: pid=%s\n' "$pid"
+        if command -v lsof >/dev/null 2>&1; then
+          if lsof -nP -p "$pid" -iTCP -sTCP:ESTABLISHED 2>/dev/null | grep -F ":${proxy_port}" >/dev/null; then
+            printf '  连接: pid=%s 观察到混合端口 %s\n' "$pid" "$proxy_port"
+          else
+            printf '  连接: pid=%s 未观察到混合端口 %s。\n' "$pid" "$proxy_port"
+          fi
+        fi
+        ;;
+    esac
+  done <<EOF
+$(ps -axo pid=,command= 2>/dev/null || true)
+EOF
+  if [ "$app_count" -eq 0 ]; then
+    printf '  Claude.app: 未发现进程\n'
+  fi
+  if [ "$bundled_count" -eq 0 ]; then
+    printf '  捆绑 claude-code 进程: 未发现\n'
+  fi
+
+  bundle_root="${HOME}/Library/Application Support/Claude/claude-code"
+  if [ -d "$bundle_root" ]; then
+    for dir in "$bundle_root"/*; do
+      [ -d "$dir" ] || continue
+      base="$(basename "$dir")"
+      printf '  已安装捆绑版本: %s\n' "$base"
+    done
+  else
+    printf '  已安装捆绑版本: 未发现桌面端 claude-code 目录\n'
+  fi
+
+  if [ "$(uname -s)" != "Darwin" ]; then
+    printf '  登录项: 当前不是 macOS，跳过。请在 Mac 上查看系统设置 → 通用 → 登录项与扩展。\n'
+  elif ! command -v osascript >/dev/null 2>&1; then
+    printf '  登录项: 无 osascript。请手动查看系统设置 → 通用 → 登录项与扩展。\n'
+  else
+    login_out="$(mktemp)"
+    osascript -e 'tell application "System Events" to get the name of every login item' >"$login_out" 2>&1 &
+    login_pid=$!
+    waited=0
+    while [ "$waited" -lt 20 ]; do
+      if ! kill -0 "$login_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+      waited=$((waited + 1))
+    done
+    if kill -0 "$login_pid" 2>/dev/null; then
+      kill "$login_pid" 2>/dev/null || true
+      wait "$login_pid" 2>/dev/null || true
+      printf '  登录项: 查询超时。Claude.app 的 Start at login 使用 SMAppService，不一定出现在传统登录项里。\n'
+    else
+      wait "$login_pid" 2>/dev/null || true
+      if grep -qi 'Claude' "$login_out" 2>/dev/null; then
+        printf '  登录项: 传统登录项里有 Claude。开机时它可能早于 Clash。\n'
+      else
+        printf '  登录项: 传统登录项里没有 Claude。应用内 Start at login 仍可能通过 SMAppService 生效。\n'
+      fi
+    fi
+    rm -f "$login_out"
+  fi
+
+  if [ -n "${MIHOMO_CONN_JSON:-}" ] && [ -f "$MIHOMO_CONN_JSON" ]; then
+    conn_note="$(jq -r '
+      (.connections // [])
+      | map(select(
+          ((.metadata.processPath // "") | test("Claude.app|claude-code"; "i"))
+          or ((.metadata.process // "") | test("Claude|claude"; "i"))
+        ))
+      | if length == 0 then "none"
+        else map(
+          ((.metadata.process // "process") + " " + (.metadata.host // .metadata.destinationIP // "?")
+            + " via " + ((.chains // []) | join(">")))
+        ) | join("; ")
+        end
+    ' "$MIHOMO_CONN_JSON" 2>/dev/null || printf 'unparsed')"
+    printf '  mihomo 连接: %s\n' "$conn_note"
+    rm -f "$MIHOMO_CONN_JSON"
+  fi
+
+  printf '  开机竞态: 本工具不修改登录项。Claude 若早于 Clash 启动，可关闭 Start at login，或打开 tun.strict-route，或等 doctor 通过后再打开桌面端。\n'
+}
+
+report_doctor_environment() {
+  [ "$DOCTOR_ENV_REPORTED" -eq 0 ] || return 0
+  DOCTOR_ENV_REPORTED=1
+  printf '\n'
+  report_mihomo
+  report_desktop
+  print_clash_snippet
+  printf '\n'
+}
+
+fail_network() {
+  local code="$1"
+
+  if [ "$COMMAND_MODE" = "doctor" ]; then
+    report_doctor_environment || true
+  fi
+  exit "$code"
 }
 
 case "$COMMAND_MODE" in
@@ -1871,15 +2769,13 @@ if [ ! -x "$CLAUDE_BIN" ]; then
   exit 2
 fi
 
-if [ ! -f "$OFFICIAL_SETTINGS" ]; then
-  printf '官方旁路 settings 不存在: %s\n' "$OFFICIAL_SETTINGS" >&2
-  exit 2
-fi
-
 if [ ! -f "$CA_CERT_FILE" ]; then
   printf '系统 CA bundle 不存在，已拒绝启动: %s\n' "$CA_CERT_FILE" >&2
   exit 2
 fi
+
+resolve_strict_lifecycle
+resolve_watchdog_strict
 
 ui_header
 
@@ -1914,7 +2810,10 @@ while [ "$attempt" -le "$IP_CHECK_RETRIES" ]; do
 done
 if [ -z "$CURRENT_IP" ]; then
   printf 'IP 检查失败：无法获取当前出口 IP。\n' >&2
-  exit 3
+  printf '探测路径：%s 经由代理 %s。\n' "$IP_CHECK_URLS" "$CLAUDE_PROXY_URL" >&2
+  printf '新的启动已被拒绝。默认不会结束已经在跑的后台会话。\n' >&2
+  write_launch_block "exit IP check unavailable" "block-new-launches"
+  fail_network 3
 fi
 ui_visual_note '出口 IP 已获取：%s' "$CURRENT_IP"
 ui_step_finish
@@ -1935,8 +2834,21 @@ ui_step_finish
 ui_step_start "出口白名单"
 if is_allowed_ip "$CURRENT_IP"; then
   ui_note 'IP 检查通过：%s' "$CURRENT_IP"
+  ui_note '出口探测与 API 同路径：%s 经由 %s' "${CURRENT_IP_SOURCE:-$IP_CHECK_URLS}" "$CLAUDE_PROXY_URL"
+  clear_launch_block
   ui_step_finish
   ui_finish
+  if [ "$COMMAND_MODE" = "doctor" ] || [ "${CLAUDE_GUARD_MIHOMO:-auto}" = "on" ]; then
+    report_doctor_environment
+  fi
+  if [ "$LIFECYCLE_BLOCK" = "1" ]; then
+    printf '生命周期策略未满足（CLAUDE_GUARD_STRICT_LIFECYCLE=1），网络检查已完成，已拒绝启动。\n' >&2
+    exit 13
+  fi
+  if [ "$DOCTOR_BLOCK" = "1" ]; then
+    printf 'mihomo 严格检查未通过，已拒绝启动。网络出口检查本身已完成。\n' >&2
+    exit 15
+  fi
   if [ "$PRECHECK_ONLY" = "1" ]; then
     if [ "$COMMAND_MODE" = "doctor" ]; then
       printf 'Doctor result: PASS (Claude was not started)\n'
@@ -1953,50 +2865,16 @@ if is_allowed_ip "$CURRENT_IP"; then
     read -r _
   fi
 else
+  allowed_display="$(jq -r '[(.allowed_ips // [])[], (.allowed_cidrs // [])[]] | join(", ")' "$CONFIG_FILE")"
   printf 'IP 检查失败：%s\n' "$CURRENT_IP" >&2
+  printf '出口与白名单不一致：探测到 %s，允许 %s。\n' "$CURRENT_IP" "$allowed_display" >&2
+  printf '探测使用与 API 相同的路径：%s 经由代理 %s。\n' "${CURRENT_IP_SOURCE:-$IP_CHECK_URLS}" "$CLAUDE_PROXY_URL" >&2
   printf '正在使用未授权的网络环境。\n' >&2
-  printf '允许的出口 IP/CIDR: ' >&2
-  jq -r '[(.allowed_ips // [])[], (.allowed_cidrs // [])[]] | join(", ")' "$CONFIG_FILE" >&2
+  printf '新的启动已被拒绝。默认不会结束已经在跑的后台会话。\n' >&2
   printf 'v%s 不提供 unsafe 绕过；已退出，未启动 Claude Official。\n' "$VERSION" >&2
-  exit 4
+  write_launch_block "exit IP not allowed ip=${CURRENT_IP}" "block-new-launches"
+  fail_network 4
 fi
 
 start_watchdog_sidecar
-
-exec env -i \
-  HOME="$HOME" \
-  USER="${USER:-user}" \
-  PATH="$PATH" \
-  TERM="${TERM:-xterm-256color}" \
-  LANG="${LANG:-en_US.UTF-8}" \
-  LC_ALL="${LC_ALL:-en_US.UTF-8}" \
-  SHELL="${SHELL:-/bin/zsh}" \
-  HTTP_PROXY="$CLAUDE_PROXY_URL" \
-  HTTPS_PROXY="$CLAUDE_PROXY_URL" \
-  ALL_PROXY="$CLAUDE_PROXY_URL" \
-  http_proxy="$CLAUDE_PROXY_URL" \
-  https_proxy="$CLAUDE_PROXY_URL" \
-  all_proxy="$CLAUDE_PROXY_URL" \
-  NO_PROXY="$NO_PROXY_LIST" \
-  no_proxy="$NO_PROXY_LIST" \
-  CLAUDE_CONFIG_DIR="$OFFICIAL_CONFIG_DIR" \
-  DISABLE_AUTOUPDATER="1" \
-  DISABLE_ERROR_REPORTING="1" \
-  DISABLE_FEEDBACK_COMMAND="1" \
-  CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY="1" \
-  DISABLE_UPDATES="1" \
-  CLAUDE_CODE_DISABLE_AGENT_VIEW="1" \
-  CLAUDE_CODE_DISABLE_CRON="1" \
-  CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF="1" \
-  CLAUDE_DISABLE_ADOPT="1" \
-  CLAUDE_CODE_DISABLE_WORKFLOWS="1" \
-  CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS="0" \
-  CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH="1" \
-  CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS="3" \
-  CLAUDE_CODE_CERT_STORE="system" \
-  SSL_CERT_FILE="$CA_CERT_FILE" \
-  NODE_EXTRA_CA_CERTS="$CA_CERT_FILE" \
-  "$CLAUDE_BIN" \
-  --setting-sources=user,project \
-  --settings "$OFFICIAL_SETTINGS" \
-  "$@"
+exec_claude "$@"

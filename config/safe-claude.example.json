@@ -1,16 +1,19 @@
 {
-  "command": "/absolute/path/to/original/claude",
-  "config_dir": "/Users/your-name/.claude-official",
+  "command": "/absolute/path/to/claude",
+  "config_dir": "/absolute/path/to/.claude",
   "allowed_ips": [
-    "203.0.113.10"
+    "23.224.141.167"
   ],
-  "allowed_cidrs": [
-    "203.0.113.0/24"
-  ],
-  "blocked_plugins": [
-    "codex@openai-codex"
-  ],
+  "allowed_cidrs": [],
+  "strict_lifecycle": false,
+  "blocked_plugins": [],
   "blocked_models": [],
   "require_unpinned_model": false,
-  "notify": false
+  "notify": true,
+  "mihomo": {
+    "api": "",
+    "group": "ClaudeAI",
+    "allowed_nodes": [],
+    "strict": false
+  }
 }
