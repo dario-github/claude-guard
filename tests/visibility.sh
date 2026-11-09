@@ -154,7 +154,7 @@ run_guard() {
 rm -f "$TMP_DIR/home/visibility-fixture/curl-calls"
 run_guard status >"$TMP_DIR/status.out"
 grep -q '^Claude Guard Status$' "$TMP_DIR/status.out"
-grep -q 'version: 2.1.3' "$TMP_DIR/status.out"
+grep -q 'version: 3.0.0' "$TMP_DIR/status.out"
 grep -q 'health: OK' "$TMP_DIR/status.out"
 grep -q 'mode: dry-run observation' "$TMP_DIR/status.out"
 grep -q 'notifications: enabled' "$TMP_DIR/status.out"
@@ -173,7 +173,7 @@ grep -q "pid=${CLAUDE_PID}.*state=healthy" "$TMP_DIR/status.out"
 
 run_guard status --json >"$TMP_DIR/status.json"
 jq -e --argjson pid "$CLAUDE_PID" '
-  .version == "2.1.3" and
+  .version == "3.0.0" and
   .health == "ok" and
   .mode == "dry-run" and
   .notifications == true and

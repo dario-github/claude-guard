@@ -1,6 +1,6 @@
 ---
 name: claude-guard
-description: Claude Code 启动门禁与运行看门狗。启动前做 fail-closed 预检（settings 残留、后台会话/Remote Control/自动更新是否关闭、项目配置与命令行是否越权覆盖、客户端版本 SHA-256 与 macOS 签章、出口 IP 白名单、api.anthropic.com 的 TLS/CONNECT、IPv6 不可达），任一不过直接拒绝启动；启动后常驻 dry-run 看门狗，低频巡检出口 IP 与官方 API 路径，出口漂移时记录降级与恢复。当用户需要确保 Claude Code 每次都从干净可信的状态启动、担心配置残留或出口漂移、需要锁定可审计版本防自动更新回归时使用。
+description: Claude Code 启动门禁与运行看门狗。出口 IP 白名单、api.anthropic.com 的 TLS/CONNECT、IPv6 不可达、路由/凭据/证书改写始终 fail-closed；hooks、插件和后台能力默认只警告，CLAUDE_GUARD_STRICT_LIFECYCLE=1 才在网络检查后拒绝。doctor 可只读查询 mihomo 并报告 Claude.app。看门狗默认不结束已有会话。当用户需要在保留后台会话的同时锁住出口时使用。
 ---
 
 # claude-guard — 启动门禁 + 运行看门狗 🚦
@@ -32,7 +32,7 @@ claude ──▶ [ 门禁 15 项预检 ] ──▶ 通过 ──▶ 真正的 Cl
 | 类别 | 具体项 |
 | --- | --- |
 | 配置残留 | 官方 settings 是否含 `ANTHROPIC_BASE_URL`、`apiKeyHelper`、`PROXY_MANAGED` 等反代/托管痕迹 |
-| 生命周期 | background agents、background tasks、cron、dynamic workflows、Remote Control、deep-link、hooks、自动更新是否都已关闭 |
+| 生命周期 | 默认只警告 hooks、插件、后台会话、cron、workflows、Remote Control。`CLAUDE_GUARD_STRICT_LIFECYCLE=1` 时这些缺口在网络检查后拒绝启动。路由、凭据、证书改写始终拒绝 |
 | 越权覆盖 | 项目 `.claude/settings.json` 是否试图改写官方路由/凭据/证书/重试；命令行是否用 `--settings`、`--bg`、`remote-control` 绕过守门 |
 | 客户端身份 | 版本号、SHA-256、macOS Team ID 与固定指针是否一致；watermark-capable 客户端的激活条件 |
 | 网络 | 出口 IPv4 是否在白名单；`api.anthropic.com` 的 HTTP CONNECT 与 TLS issuer；IPv6 是否意外可直连 |
@@ -53,9 +53,9 @@ Claude 跑着 ──▶ watchdog sidecar（每 5s tick）
 日志写 `~/.claude-guard/guard.log`（超 1MB 自动轮转），每条带目标 Claude PID，
 多会话可归因；「IP 查不到」和「查到了但不在白名单」分开记，不混成 unknown。
 
-> **诚实边界**：看门狗是 **dry-run** 的——它只记录「本来会 pause/resume」，
-> **不会真的暂停或杀掉你的 Claude**，也不污染 TUI。它不调模型、不用账号 token、
-> 不消耗额度。想要的是可信的观测面，不是替你做决定。
+> **诚实边界**：看门狗默认是观察模式。它记录「本来会 pause/resume」，并写明已有会话继续运行、新的启动由下一次出口预检拦住。**默认不会暂停或杀掉正在跑的 Claude。** `CLAUDE_GUARD_WATCHDOG_STRICT=1` 才向那棵进程树发 `TERM` 或 `STOP`。它不调模型、不用账号 token、不消耗额度，也不读取凭据或 Keychain。
+
+`doctor` 还可以只读查询 mihomo 控制器（unix socket 或 HTTP `GET`），报告 Anthropic 域名落到哪个组、组里有没有 `DIRECT`、`tun.strict-route` 是否打开，并打印一段**不会写入**的 Clash 片段。同一节报告 Claude.app 和捆绑 claude-code 是否在跑、连接是否经过混合端口。不改 Clash 配置，不改登录项。
 
 ## 附带能力：双通道版本治理
 
@@ -76,9 +76,9 @@ base URL、token 和 profile，都关闭客户端自动更新——换版本必�
 ## 不做什么（明牌）
 
 不清洗服务端标记、客户端归因或设备指纹；不规避封禁或任何平台保护措施；
-不自动重启 Claude；不修改 Clash/Mihomo 配置；不读取或打印 Claude token。
+不自动重启 Claude；不修改 Clash/Mihomo 配置或订阅；不改登录项；不读取或打印 Claude token，也不读 Keychain。
 非 Anthropic 官方项目。
 
 ## 项目
 
-MIT · https://github.com/wetlink/claude-guard
+MIT · https://github.com/dario-github/claude-guard（自 wetlink/claude-guard 2.1.3 分出）

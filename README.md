@@ -1,13 +1,13 @@
 # Claude 守护
 
-[![check](https://github.com/wetlink/claude-guard/actions/workflows/check.yml/badge.svg)](https://github.com/wetlink/claude-guard/actions/workflows/check.yml)
+[![check](https://github.com/dario-github/claude-guard/actions/workflows/check.yml/badge.svg)](https://github.com/dario-github/claude-guard/actions/workflows/check.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Claude 守护是一套 Claude Code 双通道版本与启动策略。它让官方 Claude
 通道保持严格、可审计和固定版本，同时允许本机 CC Switch 通道独立跟进较新的
 Claude Code 工程能力。两条通道共享客户端形态，但不共享 profile 和路由。
 
-当前版本：`2.1.3`（完整版本历史见文末[版本历史](#版本历史)）
+当前版本：`3.0.0`（完整版本历史见文末[版本历史](#版本历史)）。这是从 [wetlink/claude-guard](https://github.com/wetlink/claude-guard) `2.1.3` 分出的分支，上游自 2026-09-22 起没有新提交。
 
 > 本项目不是 Anthropic 或 Claude Code 官方项目。
 
@@ -15,7 +15,7 @@ Claude Code 工程能力。两条通道共享客户端形态，但不共享 prof
 
 | 入口 | 用途 | Profile | 请求目标 | 客户端策略 | 生命周期策略 |
 | --- | --- | --- | --- | --- | --- |
-| `claude` / `claude-official` | 官方 Claude 模型 | 显式固定的稳定官方 profile | `api.anthropic.com` | 固定经过验包的版本 | TUI 内后台任务可用，脱离终端 fail-closed |
+| `claude` / `claude-official` | 官方 Claude 模型 | 显式固定的稳定官方 profile | `api.anthropic.com` | 版本与哈希可选锁定 | 默认只警告；`strict_lifecycle` 恢复 fail-closed |
 | `claude-cc` | 本机 CC Switch 兼容链路 | 独立 CC Switch profile | 固定 loopback endpoint | 独立跟进经过验包的新版本 | 保留工程能力 |
 
 核心边界：
@@ -24,7 +24,7 @@ Claude Code 工程能力。两条通道共享客户端形态，但不共享 prof
   profile、settings 和 session，只替换经过验包的客户端内核。
 - CC Switch 通道不加载官方 profile 或文件凭据。macOS Keychain 是系统级边界，
   因此最终以实际 endpoint 和进程身份验证为准，不把“文件不存在”当作唯一证明。
-- 官方通道继续检查出口 IP、HTTP CONNECT、TLS issuer、IPv6 和生命周期策略。
+- 官方通道的出口 IP、HTTP CONNECT、TLS issuer 和 IPv6 仍是硬门禁。生命周期能力默认只警告，设置 `strict_lifecycle` 或 `CLAUDE_GUARD_STRICT_LIFECYCLE=1` 后，网络检查完成才 fail-closed。
 - 官方通道允许 Anthropic 官方功能开关下发，以支持内建 `/design` 等分阶段能力；
   自动更新、错误上报、反馈命令和会话质量问卷仍分别关闭。
 - CC Switch 通道检查客户端身份、本机 endpoint、监听进程路径、签名、Bundle ID、
@@ -69,8 +69,7 @@ OAuth token。项目不提供封禁规避、token 转发或风控绕过能力。
 
 ## 官方通道做什么
 
-官方通道继承 `v0.2.4` 的启动前门禁、客户端指纹 tripwire、生命周期
-fail-closed 策略和运行中 dry-run guardian。启动 Claude Code 前会检查：
+官方通道继承 `v0.2.4` 的启动前门禁和客户端指纹 tripwire。`3.0.0` 起生命周期默认只警告，运行中看门狗默认仍是观察模式。启动 Claude Code 前会检查：
 
 - 当前出口 IP 是否在 `allowed_ips` 或 `allowed_cidrs` 白名单中。
 - 未授权出口直接 fail-closed；`v2.0.0` 不再提供 `unsafe` 绕过。
@@ -83,19 +82,23 @@ fail-closed 策略和运行中 dry-run guardian。启动 Claude Code 前会检�
   官方服务端判断，不在 Guard 中硬编码猜测。
 - 可选要求官方 settings 不固定 `model`，让客户端升级后使用新的模型选择结果；
   单次模型选择仍可通过 `--model` 显式传入。
-- 客户端版本、SHA-256，以及 macOS 上可选的 Anthropic Team ID 是否与安全配置一致。
-- 官方 settings 是否允许 TUI 内 background tasks，同时明确关闭 detached background agents、cron、dynamic workflows、Remote Control、deep-link registration 和自动更新。
-- 当前项目的 `.claude/settings.json` / `.claude/settings.local.json` 是否试图覆盖官方路由、证书、凭据、重试或生命周期策略。
-- 命令行是否试图通过 `--settings`、`--setting-sources`、`--bg`、`agents` 或 `remote-control` 绕过守门。
+- 客户端版本、SHA-256，以及 macOS 上可选的 Anthropic Team ID。这三个字段都是可选锁定：不写就不拦 Claude Code 2.1.3xx；写了就必须与当前二进制一致。
+- 官方 settings 里的 hooks、插件、后台会话、workflows、cron、Remote Control 和子代理上限。默认只打印警告并继续。`strict_lifecycle: true` 时，这些缺口在网络检查通过后以退出码 13 拒绝启动。
+- 当前项目的 `.claude/settings.json` / `.claude/settings.local.json` 是否试图覆盖官方路由、证书、凭据或重试。这类改写始终 fail-closed，不随生命周期开关放宽。
+- 命令行是否试图通过 `--settings` 或 `--setting-sources` 换掉受控 profile。`--bg`、`agents` 和 `remote-control` 默认只警告，严格生命周期下拒绝。
 - `blocked_plugins` 中列出的、已知会使用 detached process 的插件是否被启用。
 
-启动后会默认启动 dry-run guardian：
+`doctor` 在网络检查之后还会只读查询 mihomo 控制器（若存在），并报告 Claude.app 与捆绑的 claude-code 是否在跑、连接是否经过代理。这两段只报告，不改 Clash，也不改登录项。
+
+启动后会默认启动观察模式的 guardian：
 
 - 每 60 秒低频检查出口 IP。
 - 每 180 秒低频检查 `api.anthropic.com` 官方路径。
 - 进入逻辑 paused 状态后，每 30 秒成对检查一次 IP 与 API，不再跟随 5 秒 tick
   重复探测。
 - 检测长时间 sleep/wake gap。
+- 出口漂移或代理不可用时写入 `~/.claude-guard/launch-block`，并在日志里记下「已有会话继续跑，新的启动由下一次预检拦住」。默认不向已有进程发信号。
+- `CLAUDE_GUARD_WATCHDOG_STRICT=1` 时才对那棵进程树发 `TERM`（或 `CLAUDE_GUARD_WATCHDOG_STRICT_SIGNAL=STOP`）。不会打到看门狗自己，也不会打到父 shell。
 - 记录“本来会 pause/resume”的动作，默认只写日志，不污染 Claude Code TUI。
 - 每条运行中日志带目标 Claude PID，区分 IP 查询不可用和实际非白名单出口。
 - 写入本地日志 `~/.claude-guard/guard.log`；超过 1MB 自动轮转为 `guard.log.1`。
@@ -270,21 +273,31 @@ cp config/safe-claude.example.json ~/.safe-claude-official.json
 
 ```json
 {
-  "command": "/usr/local/bin/claude",
-  "config_dir": "/Users/your-name/.claude-official",
-  "allowed_ips": ["203.0.113.10"],
-  "allowed_cidrs": ["203.0.113.0/24"],
-  "client_version": "2.1.220",
-  "client_sha256": "<replace-with-the-reviewed-binary-sha256>",
-  "client_macos_team_id": "Q6L2SF6YDW",
-  "blocked_plugins": ["codex@openai-codex"],
+  "command": "/Users/your-name/.npm-global/bin/claude",
+  "config_dir": "/Users/your-name/.claude",
+  "allowed_ips": ["23.224.141.167"],
+  "allowed_cidrs": [],
+  "strict_lifecycle": false,
+  "blocked_plugins": [],
   "blocked_models": [],
   "require_unpinned_model": false,
-  "notify": false
+  "notify": true,
+  "mihomo": {
+    "api": "",
+    "group": "ClaudeAI",
+    "allowed_nodes": [],
+    "strict": false
+  }
 }
 ```
 
-`203.0.113.0/24` 是文档示例网段。实际使用时请替换成你自己的固定出口 IP 或 CIDR。
+`23.224.141.167` 是本分支示例里 ClaudeAI 组的固定出口。换节点后改 `allowed_ips`。`client_version`、`client_sha256` 和 `client_macos_team_id` 仍可写入配置做可选锁定；不写则接受当前的 Claude Code 2.1.3xx。
+
+`blocked_plugins` 是显式拒绝名单。列进去且在 settings 里启用，会直接拒绝启动。日常要用的插件（包括 `codex@openai-codex`）不要放进这个数组。
+
+`strict_lifecycle` 默认 `false`。设为 `true` 等价于 `CLAUDE_GUARD_STRICT_LIFECYCLE=1`：hooks、后台会话、workflows、cron、Remote Control 等能力项不满足时，网络检查仍会跑完，然后以退出码 13 拒绝启动。环境变量优先于配置。
+
+`mihomo.api` 留空时，`doctor` 会尝试本机 Clash Verge 的 unix socket：`/var/run/clash-verge-service/users/<uid>/verge-mihomo.sock`。也可以写成 `unix:///path/to.sock` 或 `http://127.0.0.1:9090`。密钥放在 `mihomo.secret` 或 `CLAUDE_GUARD_MIHOMO_SECRET`，只用于请求头，不会打印。`mihomo.strict: true` 让 DIRECT、必需域名没进期望组、或 `tun.strict-route` 关闭时 `doctor` 以退出码 15 失败。控制器连不上只警告，不因此失败。
 
 出口探测默认只打 `api.anthropic.com/cdn-cgi/trace`，而不是第三方 IP 查询服务。原因是
 Clash、Mihomo、Surge 这类按规则分流的代理会依据目标域名选择出站策略：如果探测打的是
@@ -313,7 +326,7 @@ fail-closed（退出码 3）。
 would-pause / would-resume 状态转换时发送通知；它不会改变进程状态，也不会向
 Claude Code TUI 写入内容。环境变量 `CLAUDE_GUARD_NOTIFY=0|1` 的优先级更高。
 
-官方 profile 还必须合并 [`config/official-settings-lifecycle.example.json`](config/official-settings-lifecycle.example.json) 中的生命周期字段。不要直接覆盖自己的权限等其他设置。
+只有打开严格生命周期时，才需要把 [`config/official-settings-lifecycle.example.json`](config/official-settings-lifecycle.example.json) 合并进官方 profile。不要直接覆盖自己的权限等其他设置。默认的 warn 模式不要求这份文件，settings 缺失时也会继续做网络检查。
 
 ### CC Switch 通道
 
@@ -358,7 +371,7 @@ claude-guard diagnose
 ```
 
 `status` 和 `diagnose` 不访问网络。`doctor` 会执行与正常启动相同的 IP、TLS、
-IPv6 和配置检查，但不会启动 Claude Code，也不会提交 prompt。
+IPv6 和配置检查，并在通过后追加 mihomo 只读报告、桌面端报告和建议的 Clash 片段。它不会启动 Claude Code，也不会提交 prompt，更不会写入 Clash 或登录项。`CLAUDE_GUARD_MIHOMO=off` 可跳过控制器查询；`on` 则让普通预检也打印这段报告。默认 `auto` 只在 `doctor` 里查询。
 
 官方通道只做预检，不启动 Claude：
 
@@ -410,8 +423,14 @@ CLAUDE_GUARD_SETTINGS=~/.claude-official/settings.json
 CLAUDE_GUARD_PROXY=http://127.0.0.1:7897
 CLAUDE_GUARD_IP_CHECK_URLS="https://api.anthropic.com/cdn-cgi/trace"
 CLAUDE_GUARD_ASSUME_YES=1
+CLAUDE_GUARD_STRICT_LIFECYCLE=0
 CLAUDE_GUARD_WATCHDOG=1
 CLAUDE_GUARD_WATCHDOG_DRY_RUN=1
+CLAUDE_GUARD_WATCHDOG_STRICT=0
+CLAUDE_GUARD_WATCHDOG_STRICT_SIGNAL=TERM
+CLAUDE_GUARD_MIHOMO=auto
+CLAUDE_GUARD_MIHOMO_API=
+CLAUDE_GUARD_MIHOMO_STRICT=0
 CLAUDE_GUARD_RECOVERY_INTERVAL=30
 CLAUDE_GUARD_DRY_RUN_STDERR=0
 CLAUDE_GUARD_NOTIFY=0
@@ -421,23 +440,47 @@ CLAUDE_GUARD_LOG_FILE=~/.claude-guard/guard.log
 CLAUDE_GUARD_LOG_MAX_BYTES=1048576
 ```
 
-## 生命周期 Fail-Closed
+## 生命周期：默认警告，严格模式才拒绝
 
-官方通道从 `v2.1.1` 起默认要求：
+`3.0.0` 起，hooks、插件、后台会话、agent view、workflows、cron、Remote Control、deep-link、子代理上限和 MCP 自动后台化默认只警告。带这些能力的 profile 只要出口在白名单里，`doctor` 和 `--precheck-only` 可以通过。settings 文件不存在同样只警告，并继续做网络检查；启动时若没有这份文件，就不会传 `--settings`。
 
-- `claude agents`、`--bg`、`/background` 和 on-demand supervisor 关闭。
-- 当前 TUI 内的 Bash/subagent 后台任务、`run_in_background` 和 `Ctrl+B` 可用；
-  它们必须随前台 TUI 退出而终止。
-- cron、dynamic workflows、Remote Control 和 deep-link registration 关闭。
-- MCP 长调用的自动后台化关闭。
-- 自动更新和手动自更新关闭，由维护者先验包后再更新固定版本。
-- `CLAUDE_CODE_RETRY_WATCHDOG` 必须不存在，避免无人值守时持续数小时重试。
-- 子代理嵌套深度为 `1`，同时运行上限为 `3`。
-- 所有 hooks 暂停，避免第三方 hook 在终端退出期间派生独立进程。
+下面这些仍然立刻 fail-closed，不受该开关影响：
 
-这些设置来自 Claude Code 的公开配置接口，不改写请求、不伪装客户端，也不绕过保护措施。代价是不能使用脱离 TUI 的后台 session、Remote Control、dynamic workflows 和 hooks；普通前台交互、内置工具与受限的前台/后台子代理仍可使用。
+- settings 或项目配置里的路由、凭据、证书、`processWrapper`、`CLAUDE_CODE_RETRY_WATCHDOG`。
+- 命令行 `--settings` / `--setting-sources`。
+- `blocked_plugins` 里列出且已启用的插件。
+- 出口不在 `allowed_ips` / `allowed_cidrs`、代理 CONNECT 失败、TLS issuer 异常、公网 IPv6 可直连。
+- settings JSON 不合法（退出码 5）。
 
-当前官方 profile 中的 `codex@openai-codex` 插件包含 detached broker/background worker，因此建议列入 `blocked_plugins` 并在该 profile 中关闭。Codex App、Codex CLI 和 `claude-cc` 不受影响。
+`CLAUDE_GUARD_STRICT_LIFECYCLE=1` 或 `"strict_lifecycle": true` 恢复 `v2.1.1` 的能力项要求。网络检查先跑完，不满足时打印缺口并以退出码 13 退出。严格模式启动时还会注入 `CLAUDE_CODE_DISABLE_AGENT_VIEW`、`CLAUDE_CODE_DISABLE_CRON`、`CLAUDE_CODE_DISABLE_BG_EXIT_HANDOFF`、`CLAUDE_DISABLE_ADOPT`、`CLAUDE_CODE_DISABLE_WORKFLOWS`、`CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS=0` 以及子代理上限。默认模式不注入这些变量，仍会注入关闭自动更新、错误上报、反馈问卷，以及代理和 CA。
+
+`config/official-settings-lifecycle.example.json` 仍是严格模式的 settings 样例，不是默认 profile。
+
+## Mihomo 只读检查
+
+`doctor` 用 `GET` 查询控制器的 `/configs`、`/proxies`、`/rules`、`/connections`。它报告：
+
+- Anthropic / Claude 必需域名当前落到哪个策略组、组里选中了哪个节点。
+- 该组是否包含 `DIRECT`，或包含未列入 `mihomo.allowed_nodes` 的节点。`allowed_nodes` 为空时只查 `DIRECT`。
+- `tun.enable`、`tun.strict-route`、`tun.stack`、`dns.enhanced-mode`、`ipv6`。
+- 官方网络文档里的必需域名有哪些没被 Domain / DomainSuffix / DomainKeyword / Match 覆盖。GeoIP、GeoSite 和进程规则离线算不了，会跳过而不是当成已覆盖。
+- Datadog 遥测域名若没进期望组，只记「遥测未覆盖」，不触发严格失败。
+
+报告末尾打印一段建议的 Clash 片段，并写明没有写入任何配置或订阅。本工具没有改 Clash 的代码路径。
+
+## 桌面端与开机竞态
+
+`doctor` 的桌面端一节只做检测：
+
+- `ps` 里是否有 `Claude.app` 和 `~/Library/Application Support/Claude/claude-code/` 下的捆绑进程，以及该目录里有哪些版本。
+- `lsof` 是否看到它们连到混合端口（默认 `7897`）。TUN 开启时套接字仍可能显示公网地址，这时对照 mihomo `/connections`。
+- macOS 上用最多约 2 秒查询传统登录项里有没有 Claude。应用内 Start at login 走 SMAppService，不一定出现在这份列表里。
+
+Claude 若在 Clash 之前启动，流量会在 TUN 还没起来时直连。可选做法（都要自己做，本工具不改登录项）：
+
+- 关掉 Claude.app 的 Start at login，等 `claude-guard doctor` 通过后再打开。
+- 把 `tun.strict-route` 设为 `true`，让 TUN 没就绪时流量失败而不是绕过。
+- 用报告里的 `PROCESS-NAME,Claude` / `PROCESS-NAME,claude` 规则把桌面进程送进 ClaudeAI 组。
 
 ## 客户端指纹 Tripwire
 
@@ -466,11 +509,11 @@ CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 
 ## 当前边界
 
-运行中 guardian 仍然只做 dry-run，不会真的暂停、恢复或 kill 正在运行的 Claude Code。
+运行中 guardian 默认仍是观察模式。出口漂移时它写日志、发可选通知，并留下 launch-block 记录；已经在跑的 Claude Code 和 Codex 会话不会被暂停或杀掉。下一次 `claude-guard` 启动会重新探测 `api.anthropic.com/cdn-cgi/trace`，出口不对就拒绝这次启动。过期的 launch-block 文件不会单独否决一次已经通过的探测。
 
-这是有意为之：当前 launcher 保持 Claude Code 作为前台 TUI 运行，不能安全地只暂停主 PID。真正 action mode 必须暂停整个 Claude 进程组，否则子进程可能继续执行或联网。`v2.0.0` 仍会在用户设置 `CLAUDE_GUARD_WATCHDOG_DRY_RUN=0` 时拒绝启动 action mode，而不是给出虚假的安全感。
+`CLAUDE_GUARD_WATCHDOG_DRY_RUN=0` 且没有 `CLAUDE_GUARD_WATCHDOG_STRICT=1` 时，看门狗拒绝进入那种「声称会暂停、实际上不安全」的模式（退出码 9）。严格模式对目标进程树发 `TERM` 或 `STOP`；`STOP` 之后若配置了 kill-after-pause，恢复前会再发 `TERM`。`TERM` 之后无法把原进程拉起来，恢复只意味着下一次启动可以放行。
 
-在背景功能关闭的情况下，正常前台 Claude 随终端退出；真实 pause/resume 或官方 `processWrapper` 支持会作为独立版本评估。
+本分支仍然不做时区或 locale 伪装、token 提取或转发、请求改写、封禁规避，也不读取凭据文件或 Keychain。
 
 ## 验证
 
@@ -495,7 +538,9 @@ CLAUDE_GUARD_FINGERPRINT_MODE=fail-active
 - 缺失配置失败路径。
 - `command` 非绝对路径失败路径。
 - 客户端指纹 tripwire active/strict 失败路径。
-- 生命周期必需设置失败路径。
+- 生命周期默认警告：hooks 与插件开启时预检仍通过；严格开关在网络检查之后 fail-closed。
+- 出口白名单不一致时的探测路径与允许列表文案。
+- 生命周期必需设置在 `CLAUDE_GUARD_STRICT_LIFECYCLE=1` 下的失败路径。
 - `CLAUDE_CODE_RETRY_WATCHDOG` 拒绝路径。
 - 客户端版本和 SHA-256 不匹配失败路径。
 - 已知 detached 插件拒绝路径。
@@ -524,6 +569,17 @@ python3 scripts/verify-terminal-exit.py
 它会启动 `--safe-mode` TUI、关闭伪终端并检查残留进程；不会提交 prompt。
 
 ## 版本历史
+
+### 3.0.0 - 生命周期改为默认警告，并加上只读 mihomo / 桌面端报告
+
+`3.0.0` 是本分支相对上游 `2.1.3` 的行为变化。网络门禁没有放宽。
+
+- 生命周期能力项默认只警告。`strict_lifecycle` / `CLAUDE_GUARD_STRICT_LIFECYCLE=1` 在出口、CONNECT、TLS 和 IPv6 都跑完之后恢复 fail-closed（退出码 13）。路由、凭据和证书改写仍立刻拒绝。
+- 客户端版本和 SHA-256 继续是可选锁定，不再把某一版 2.1.220 当成必须安装的版本。
+- 出口探测仍走配置代理访问 `api.anthropic.com/cdn-cgi/trace`，与白名单不一致时同时打印探测到的 IP、允许的 IP、探测 URL 和代理。
+- `doctor` 只读查询 mihomo（unix socket 或 HTTP），报告策略组、DIRECT、`strict-route` 和未覆盖的官方域名，并打印一段不会落盘的 Clash 片段。`CLAUDE_GUARD_MIHOMO_STRICT=1` 时这些告警让 doctor 以退出码 15 失败。
+- 看门狗默认不结束已有会话。`CLAUDE_GUARD_WATCHDOG_STRICT=1` 才向目标进程树发信号。
+- `doctor` 增加桌面端一节：Claude.app、捆绑 claude-code、混合端口和登录项。不修改登录项。
 
 ### 2.1.3 - curl 配置来源与信任锚加固
 
